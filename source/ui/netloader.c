@@ -17,6 +17,19 @@ static int udpfd    = -1;
 static volatile size_t filelen, filetotal;
 static volatile bool wantExit = false;
 
+/* Background mode: a thread listens for 3dslink from start-up on, so a build
+ * can be sent and started without anyone pressing Y. Y only shows the screen.
+ * Before the console sleeps the network is let go (sockets open across sleep
+ * can keep it from waking) and taken again after. */
+static Thread s_bgThread;
+static volatile bool s_background, s_bgStop, s_sleeping, s_bgIdle = true, s_inBackground, s_screenShown;
+static aptHookCookie s_aptHook;
+
+static bool shouldStop(void)
+{
+	return wantExit || (s_inBackground && (s_bgStop || s_sleeping));
+}
+
 static void netloaderError(const char* func, int err);
 
 static bool set_socket_nonblocking(int sock)
@@ -39,6 +52,12 @@ static int recvall(int sock, void* buffer, int size, int flags)
 			break;
 		} else if (len < 0)
 		{
+			if (shouldStop())
+			{
+				netloaderError("stopped", 0);
+				size = 0;
+				break;
+			}
 			if (errno != EAGAIN && errno != EWOULDBLOCK)
 			{
 				netloaderError("recv", errno);
@@ -68,7 +87,7 @@ static bool netloaderActivate(void)
 		if (!(udpfd < 0 && errno == -ENETDOWN))
 			break;
 		svcSleepThread(16666666ULL);
-		if (wantExit)
+		if (shouldStop())
 			return false;
 	}
 	if (udpfd < 0)
@@ -152,6 +171,14 @@ static void netloaderDeactivate(void)
 void netloaderError(const char* func, int err)
 {
 	netloaderDeactivate();
+	if (s_inBackground)
+	{
+		/* No error screen: the listener just starts over. */
+		if (s_screenShown && uiGetStateInfo()->update == netloaderUpdate)
+			uiExitState();
+		s_screenShown = false;
+		return;
+	}
 	networkError(netloaderUpdate, StrId_NetLoader, func, err);
 }
 
@@ -244,36 +271,48 @@ static int receiveAndDecompress(int sock, FILE* fh, size_t filesize)
 	return ret == Z_STREAM_END ? Z_OK : Z_DATA_ERROR;
 }
 
-void netloaderTask(void* arg)
+/* One listen-receive-launch round; true when a file was launched. */
+static bool netloaderRun(bool background)
 {
 	struct sockaddr_in sa_udp_remote;
 	char recvbuf[256];
-	wantExit = false;
+	if (!background)
+		wantExit = false;
 	filelen = 0;
 	filetotal = 0;
+	s_inBackground = background;
 
 	if (!netloaderInit())
 	{
-		errorScreen(textGetString(StrId_NetLoader), textGetString(StrId_NetLoaderUnavailable));
-		return;
+		if (!background)
+			errorScreen(textGetString(StrId_NetLoader), textGetString(StrId_NetLoaderUnavailable));
+		return false;
 	}
 
-	uiEnterState(UI_STATE_NETLOADER);
+	if (!background)
+		uiEnterState(UI_STATE_NETLOADER);
 
 	if (!netloaderActivate())
 	{
 		netloaderDeactivate();
-		uiExitState();
-		return;
+		if (!background)
+			uiExitState();
+		return false;
 	}
 
 	while (datafd < 0)
 	{
-		if (wantExit)
+		if (shouldStop())
 		{
 			netloaderDeactivate();
-			uiExitState();
-			return;
+			if (!background)
+				uiExitState();
+			else if (s_screenShown && uiGetStateInfo()->update == netloaderUpdate)
+			{
+				uiExitState();
+				s_screenShown = false;
+			}
+			return false;
 		}
 
 		socklen_t fromlen = sizeof(sa_udp_remote);
@@ -293,12 +332,18 @@ void netloaderTask(void* arg)
 			if (errno != -EWOULDBLOCK && errno != EWOULDBLOCK)
 			{
 				netloaderError("accept", errno);
-				return;
+				return false;
 			}
 		} else
 		{
 			close(listenfd);
 			listenfd = -1;
+			/* Someone is sending: show the progress. */
+			if (background && !s_screenShown)
+			{
+				s_screenShown = true;
+				uiEnterState(UI_STATE_NETLOADER);
+			}
 		}
 
 		svcSleepThread(16666666ULL);
@@ -309,14 +354,14 @@ void netloaderTask(void* arg)
 	if (len != 4 || namelen >= (sizeof(recvbuf)+1))
 	{
 		netloaderError("namelen", errno);
-		return;
+		return false;
 	}
 
 	len = recvall(datafd, recvbuf, namelen, 0);
 	if (len != namelen)
 	{
 		netloaderError("name", errno);
-		return;
+		return false;
 	}
 
 	recvbuf[namelen] = 0;
@@ -324,7 +369,7 @@ void netloaderTask(void* arg)
 	if (len != 4)
 	{
 		netloaderError("filelen", errno);
-		return;
+		return false;
 	}
 
 	int response = 0;
@@ -343,7 +388,7 @@ void netloaderTask(void* arg)
 	if (response < 0)
 	{
 		netloaderError("fopen", errno);
-		return;
+		return false;
 	}
 
 	static char fbuf[64*1024];
@@ -352,7 +397,7 @@ void netloaderTask(void* arg)
 	fclose(outf);
 
 	if (len != Z_OK)
-		return;
+		return false;
 
 	send(datafd, &response, sizeof(response), 0);
 
@@ -382,21 +427,103 @@ void netloaderTask(void* arg)
 	}
 
 	netloaderDeactivate();
-	uiExitState();
+	if (!background || s_screenShown)
+		uiExitState();
+	s_screenShown = false;
 	launchMenuEntry(&me);
+	return true;
 }
+
+void netloaderTask(void* arg)
+{
+	if (s_background)
+	{
+		/* The listener is already up: just show its screen. */
+		s_screenShown = true;
+		uiEnterState(UI_STATE_NETLOADER);
+		return;
+	}
+	netloaderRun(false);
+}
+
+static void netloaderBackgroundProc(void* arg)
+{
+	while (!s_bgStop)
+	{
+		if (s_sleeping)
+		{
+			s_bgIdle = true;
+			svcSleepThread(100000000ULL);
+			continue;
+		}
+		s_bgIdle = false;
+		const bool launched = netloaderRun(true);
+		s_bgIdle = true;
+		if (launched)
+			break; /* the menu is on its way out */
+		if (!s_bgStop && !s_sleeping)
+			svcSleepThread(1000000000ULL);
+	}
+	s_bgIdle = true;
+}
+
+static void netloaderAptHook(APT_HookType hook, void* param)
+{
+	if (hook == APTHOOK_ONSLEEP)
+	{
+		s_sleeping = true;
+		/* Let the listener close its sockets before the console sleeps. */
+		for (int i = 0; i < 150 && !s_bgIdle; i ++)
+			svcSleepThread(10000000ULL);
+	} else if (hook == APTHOOK_ONWAKEUP)
+	{
+		s_sleeping = false;
+	}
+}
+
+void netloaderStartBackground(void)
+{
+	if (s_background) return;
+	s_background = true;
+	s_bgStop = false;
+	aptHook(&s_aptHook, netloaderAptHook, NULL);
+	s_bgThread = threadCreate(netloaderBackgroundProc, NULL, 32*1024, 0x30, -2, false);
+	if (!s_bgThread)
+	{
+		s_background = false;
+		aptUnhook(&s_aptHook);
+	}
+}
+
+
 
 void netloaderUpdate(void)
 {
 	if (wantExit || datafd >= 0) return;
 
 	if (hidKeysDown() & KEY_B)
-		wantExit = true;
+	{
+		if (s_background)
+		{
+			/* Hide the screen; the listener stays. */
+			s_screenShown = false;
+			uiExitState();
+		} else
+			wantExit = true;
+	}
 }
 
 void netloaderExit(void)
 {
 	wantExit = true;
+	if (s_background)
+	{
+		s_bgStop = true;
+		threadJoin(s_bgThread, 3000000000ULL);
+		threadFree(s_bgThread);
+		aptUnhook(&s_aptHook);
+		s_background = false;
+	}
 }
 
 void netloaderDrawBot(void)

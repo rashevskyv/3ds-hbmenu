@@ -3,33 +3,59 @@
 #include <malloc.h>
 
 static void* SOC_buffer;
+/* The background netloader keeps the network up while the menu runs; the
+ * netloader screen and the netsender share it rather than start it again. */
+static int s_users;
+static LightLock s_lock = 1;
 
 bool networkInit(void)
 {
+	LightLock_Lock(&s_lock);
+	if (s_users > 0)
+	{
+		++s_users;
+		LightLock_Unlock(&s_lock);
+		return true;
+	}
 	if (!SOC_buffer)
 	{
 		SOC_buffer = memalign(0x1000, 0x100000);
 		if (!SOC_buffer)
+		{
+			LightLock_Unlock(&s_lock);
 			return false;
+		}
 	}
 
 	Result ret = socInit(SOC_buffer, 0x100000);
 	if (R_FAILED(ret))
 	{
 		socExit();
+		LightLock_Unlock(&s_lock);
 		return false;
 	}
+	s_users = 1;
+	LightLock_Unlock(&s_lock);
 	return true;
 }
 
 void networkDeactivate(void)
 {
+	LightLock_Lock(&s_lock);
+	if (s_users > 1)
+	{
+		--s_users;
+		LightLock_Unlock(&s_lock);
+		return;
+	}
+	s_users = 0;
 	socExit();
 	if (SOC_buffer)
 	{
 		free(SOC_buffer);
 		SOC_buffer = NULL;
 	}
+	LightLock_Unlock(&s_lock);
 }
 
 // xError in their own files call xDeactivate beforehand

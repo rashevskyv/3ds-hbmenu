@@ -48,6 +48,7 @@ int main()
 	backgroundInit();
 
 	workerSchedule(startup, NULL);
+	netloaderStartBackground();
 
 	// Main loop
 	while (aptMainLoop())
