@@ -8,12 +8,18 @@
 #include <fcntl.h>
 
 #include <zlib.h>
+#include <dirent.h>
+#include <strings.h>
 
 #define ZLIB_CHUNK (16 * 1024)
 
 static int listenfd = -1;
 static int datafd   = -1;
 static int udpfd    = -1;
+/* Background mode only: commands over HTTP on NETWORK_PORT+1 --
+ *   GET /ping, GET /list (the .3dsx in sdmc:/3ds), GET /launch?path=/3ds/x.3dsx */
+static int cmdfd    = -1;
+#define COMMAND_PORT (NETWORK_PORT + 1)
 static volatile size_t filelen, filetotal;
 static volatile bool wantExit = false;
 
@@ -142,11 +148,30 @@ static bool netloaderActivate(void)
 		return false;
 	}
 
+	if (s_inBackground)
+	{
+		cmdfd = socket(AF_INET, SOCK_STREAM, 0);
+		serv_addr.sin_port = htons(COMMAND_PORT);
+		if (cmdfd < 0 || bind(cmdfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) != 0 ||
+			!set_socket_nonblocking(cmdfd) || listen(cmdfd, 4) != 0)
+		{
+			/* Without commands the netloader still works. */
+			if (cmdfd >= 0) close(cmdfd);
+			cmdfd = -1;
+		}
+	}
+
 	return true;
 }
 
 static void netloaderDeactivate(void)
 {
+	if (cmdfd >= 0)
+	{
+		close(cmdfd);
+		cmdfd = -1;
+	}
+
 	if (listenfd >= 0)
 	{
 		close(listenfd);
@@ -271,6 +296,99 @@ static int receiveAndDecompress(int sock, FILE* fh, size_t filesize)
 	return ret == Z_STREAM_END ? Z_OK : Z_DATA_ERROR;
 }
 
+static void sendText(int fd, int status, const char* text)
+{
+	char head[128];
+	int n = snprintf(head, sizeof(head), "HTTP/1.0 %d %s\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+		status, status == 200 ? "OK" : status == 404 ? "Not Found" : "Bad Request");
+	send(fd, head, n, 0);
+	send(fd, text, strlen(text), 0);
+}
+
+static int fromHex(char c)
+{
+	return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* One command connection; true (and `me` filled) when it asks to launch. */
+static bool handleCommand(int fd, menuEntry_s* me)
+{
+	char req[512];
+	int got = 0;
+	u64 start = osGetTime();
+	while (got < (int)sizeof(req) - 1 && osGetTime() - start < 2000)
+	{
+		int n = recv(fd, req + got, sizeof(req) - 1 - got, 0);
+		if (n > 0) { got += n; req[got] = 0; if (strstr(req, "\r\n\r\n") || strstr(req, "\n\n")) break; }
+		else if (n == 0) break;
+		else svcSleepThread(5000000ULL);
+	}
+	req[got] = 0;
+	char target[400] = { 0 };
+	if (sscanf(req, "%*7s %399s", target) != 1)
+	{
+		sendText(fd, 400, "bad request\n");
+		return false;
+	}
+	if (strcmp(target, "/ping") == 0)
+	{
+		sendText(fd, 200, "hbmenu " VERSION "\n");
+		return false;
+	}
+	if (strcmp(target, "/list") == 0)
+	{
+		static char list[4096];
+		int n = 0;
+		list[0] = 0;
+		DIR* dir = opendir("sdmc:/3ds");
+		if (dir)
+		{
+			struct dirent* de;
+			while ((de = readdir(dir)) && n < (int)sizeof(list) - 300)
+			{
+				size_t len = strlen(de->d_name);
+				if (len > 5 && strcasecmp(de->d_name + len - 5, ".3dsx") == 0)
+					n += snprintf(list + n, sizeof(list) - n, "/3ds/%s\n", de->d_name);
+			}
+			closedir(dir);
+		}
+		sendText(fd, 200, list);
+		return false;
+	}
+	const char* q = strstr(target, "/launch?path=");
+	if (!q)
+	{
+		sendText(fd, 404, "try /ping, /list, /launch?path=/3ds/x.3dsx\n");
+		return false;
+	}
+	/* The path, %-decoded; "/3ds/x.3dsx" or "sdmc:/3ds/x.3dsx". */
+	char path[300];
+	int o = 0;
+	for (const char* c = q + 13; *c && *c != '&' && o < (int)sizeof(path) - 1; c ++)
+	{
+		if (*c == '%' && fromHex(c[1]) >= 0 && fromHex(c[2]) >= 0) { path[o++] = (char)(fromHex(c[1]) * 16 + fromHex(c[2])); c += 2; }
+		else if (*c == '+') path[o++] = ' ';
+		else path[o++] = *c;
+	}
+	path[o] = 0;
+	menuEntryInit(me, ENTRY_TYPE_FILE);
+	snprintf(me->path, sizeof(me->path), "%s%s", strncmp(path, "sdmc:", 5) == 0 ? "" : "sdmc:", path);
+	FILE* f = fopen(me->path, "rb");
+	if (!f)
+	{
+		sendText(fd, 404, "no such file\n");
+		return false;
+	}
+	fclose(f);
+	/* argv[0] is the file, as when it is picked in the menu: romfs needs it. */
+	argData_s* ad = &me->args;
+	ad->buf[0] = 0;
+	ad->dst = (char*)&ad->buf[1];
+	launchAddArg(ad, me->path);
+	sendText(fd, 200, "launching\n");
+	return true;
+}
+
 /* One listen-receive-launch round; true when a file was launched. */
 static bool netloaderRun(bool background)
 {
@@ -323,6 +441,29 @@ static bool netloaderRun(bool background)
 			sa_udp_remote.sin_family = AF_INET;
 			sa_udp_remote.sin_port = htons(NETWORK_PORT);
 			sendto(udpfd, "boot3ds", 7, 0, (struct sockaddr*) &sa_udp_remote,sizeof(sa_udp_remote));
+		}
+
+		if (cmdfd >= 0)
+		{
+			struct sockaddr_in from;
+			socklen_t fromlen2 = sizeof(from);
+			int fd = accept(cmdfd, (struct sockaddr*)&from, &fromlen2);
+			if (fd >= 0)
+			{
+				static menuEntry_s cme;
+				const bool launch = handleCommand(fd, &cme);
+				svcSleepThread(50000000ULL); /* let the answer leave */
+				close(fd);
+				if (launch)
+				{
+					netloaderDeactivate();
+					if (s_screenShown && uiGetStateInfo()->update == netloaderUpdate)
+						uiExitState();
+					s_screenShown = false;
+					launchMenuEntry(&cme);
+					return true;
+				}
+			}
 		}
 
 		socklen_t addrlen = sizeof(struct sockaddr_in);
